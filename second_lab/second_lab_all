@@ -1,0 +1,319 @@
+-- Варианты ходов
+-- silent это 0
+-- testifies это 1
+inductive Move where
+  | silent
+  | testifies
+  deriving BEq, Inhabited
+
+def opposite (move : Move) : Move :=
+  match move with
+  | .silent => .testifies
+  | .testifies => .silent
+
+-- Это для возможности вывода действий текстом
+instance : ToString Move where
+  toString move := match move with
+  | .silent => "сотрудничать(0)"
+  | .testifies => "предать(1)"
+
+-- Очки для первого
+def score (move₁ move₂ : Move) : Nat :=
+  match move₁, move₂ with
+  | .silent, .silent => 3
+  | .silent, .testifies => 0
+  | .testifies, .silent => 5
+  | .testifies, .testifies => 1
+
+-- Вспомогательная функция для случайности (шанс в процентах)
+def chance (percent : Nat) : IO Bool := do
+  let r ← IO.rand 1 100
+  pure (r ≤ percent)
+
+-- Структура для стратегии
+structure Strategy (Q : Type) where
+  init : IO Q
+  action : Q → IO Move
+  nextState : Q → Move → IO Q
+
+
+-- детерменированные
+
+-- всегда предаёт (1)
+def Alex : Strategy Unit where
+  init := pure ()
+  action _ := pure .testifies
+  nextState _ _ := pure ()
+
+-- всегда сотрудничает (0)
+def Bob : Strategy Unit where
+  init := pure ()
+  action _ := pure .silent
+  nextState _ _ := pure ()
+
+-- в начале 0, затем копирует
+def Clara : Strategy Move where
+  init := pure .silent
+  action q := pure q
+  nextState _ opponentMove := pure opponentMove
+
+-- в начале 0, затем противоположное
+def Denis : Strategy Move where
+  init := pure .silent
+  action q := pure q
+  nextState _ opponentMove := pure (opposite opponentMove)
+
+-- всегда 0, но 1 раз в 20 ходов выдаёт 1
+def Emma : Strategy Nat where
+  init := pure 1
+  action q := pure (if q == 0 then .testifies else .silent)
+  nextState q _ := pure ((q + 1) % 20)
+
+-- всегда 0, пока не предали
+def Frida : Strategy Bool where
+  init := pure true
+  action q := pure (if q then .silent else .testifies)
+  nextState q opponentMove :=
+    pure (if !q then false
+    else opponentMove == .silent)
+
+-- в начале 0, потом копирует, но вместо каждого 10-ого предательства сотрудничает
+def George : Strategy (Move × Nat) where
+  init := pure (.silent, 0)
+  action q := pure (if q.snd >= 3 then .silent else q.fst)
+  nextState q opponentMove := pure (
+    let count :=
+      if opponentMove == .testifies then
+        q.snd + 1
+      else
+        0
+    (opponentMove, count)
+  )
+
+-- стохастические
+
+-- 0 или 1 равновероятно
+def Hank : Strategy Unit where
+  init := pure ()
+  action _ := do if ← chance 50 then pure .silent else pure .testifies
+  nextState _ _ := pure ()
+
+-- 0 с вероятностью 0.9
+def Ivan : Strategy Unit where
+  init := pure ()
+  action _ := do if ← chance 90 then pure .silent else pure .testifies
+  nextState _ _ := pure ()
+
+-- в начале 0, затем копирует, но если 1, то прощает с вероятностью 0.25
+def Jack : Strategy (Option Move) where
+  init := pure none
+  action q := do
+    match q with
+    | none => pure .silent
+    | some .silent => pure .silent
+    | some .testifies => if ← chance 25 then pure .silent else pure .testifies
+  nextState _ opp := pure (some opp)
+
+-- в начале 0, затем повторяет, но с вероятностью 0.25 выдает противоположное
+def Kevin : Strategy (Option Move) where
+  init := pure none
+  action q := do
+    let lastMove := q.getD .silent
+    if ← chance 25 then pure (opposite lastMove) else pure lastMove
+  nextState _ opp := pure (some opp)
+
+-- генерирует N [1..50] и каждые N ходов выдает 1, остальные 0
+def Lucas : Strategy (Nat × Nat) where
+  init := do
+    let n ← IO.rand 1 50
+    pure (n, 1)
+  action q := pure (if q.snd % q.fst == 0 then .testifies else .silent)
+  nextState q _ := pure (q.fst, q.snd + 1)
+
+-- генерирует N [1..20], играет 0 N раз, затем N [1..20], играет 1 N раз...
+def Maks : Strategy (Move × Nat) where
+  init := do
+    let n ← IO.rand 1 20
+    pure (.silent, n)
+  action q := pure q.fst
+  nextState q _ := do
+    if q.snd > 1 then
+      pure (q.fst, q.snd - 1)
+    else
+      let newN ← IO.rand 1 20
+      pure (opposite q.fst, newN)
+
+-- Natan (Кастомная): "Щедрое око за око". Копирует оппонента,
+-- но с шансом 10% прощает предательство (0), а с шансом 5% случайно предает сам (1).
+def Natan : Strategy (Option Move) where
+  init := pure none
+  action q := do
+    let opp := q.getD .silent
+    if opp == .testifies then
+      if ← chance 10 then pure .silent else pure .testifies
+    else
+      if ← chance 5 then pure .testifies else pure .silent
+  nextState _ opp := pure (some opp)
+
+
+-- игра------------------------------------------------------------------
+structure GameStats where
+  scoreA : Nat := 0
+  scoreB : Nat := 0
+  streakA_max : Nat := 0
+  streakA_curr : Nat := 0
+
+def playMatch {Q₁ Q₂ : Type} (strat₁ : Strategy Q₁) (strat₂ : Strategy Q₂) (nRounds : Nat) : IO GameStats := do
+  let init₁ ← strat₁.init
+  let init₂ ← strat₂.init
+  let rec loop (n : Nat) (q₁ : Q₁) (q₂ : Q₂) (stats : GameStats) : IO GameStats := do
+    match n with
+    | 0 => pure stats
+    | k + 1 =>
+      let m₁ ← strat₁.action q₁
+      let m₂ ← strat₂.action q₂
+      let s₁ := score m₁ m₂
+      let s₂ := score m₂ m₁
+      let currA := if s₁ == 5 then stats.streakA_curr + 1 else 0
+
+      let newStats := {
+        scoreA := stats.scoreA + s₁
+        scoreB := stats.scoreB + s₂
+        streakA_curr := currA
+        streakA_max := max stats.streakA_max currA
+      }
+      let next₁ ← strat₁.nextState q₁ m₂
+      let next₂ ← strat₂.nextState q₂ m₁
+      loop k next₁ next₂ newStats
+  loop nRounds init₁ init₂ {}
+
+-- Итоговая статистика симуляций
+structure SimStats where
+  mean : Float
+  median : Float
+  variance : Float
+
+-- Вспомогательная функция: округление для красивого вывода
+def round1 (x : Float) : Float := (Float.round (x * 10.0)) / 10.0
+
+-- Запускает numSims матчей и считает все метрики для стохастики
+def runSimulations {Q₁ Q₂ : Type} (s₁ : Strategy Q₁) (s₂ : Strategy Q₂) (nRounds numSims : Nat) : IO SimStats := do
+  let mut scores : Array Nat := #[]
+
+  for _ in [0:numSims] do
+    let st ← playMatch s₁ s₂ nRounds
+    scores := scores.push st.scoreA
+
+  let sum := scores.foldl (· + ·) 0
+  let mean := sum.toFloat / numSims.toFloat
+
+  let sorted := scores.qsort (· < ·)
+  let mid := numSims / 2
+  let median := if numSims % 2 == 1 then
+    sorted[mid]!.toFloat
+  else
+    (sorted[mid - 1]!.toFloat + sorted[mid]!.toFloat) / 2.0
+
+  let varSum := scores.foldl (fun acc x =>
+    let diff := x.toFloat - mean
+    acc + (diff * diff)
+  ) 0.0
+  let variance := varSum / numSims.toFloat
+
+  pure ⟨round1 mean, round1 median, round1 variance⟩
+
+
+inductive AnyStrategy where
+  | mk {Q : Type} (name : String) (strat : Strategy Q)
+
+-- Разделяем стратегии для вывода правильных таблиц
+def detStrategies : List AnyStrategy := [
+  .mk "Alex" Alex, .mk "Bob" Bob, .mk "Clara" Clara, .mk "Denis" Denis,
+  .mk "Emma" Emma, .mk "Frida" Frida, .mk "George" George
+]
+
+def allStrategies : List AnyStrategy := [
+  .mk "Alex" Alex, .mk "Bob" Bob, .mk "Clara" Clara, .mk "Denis" Denis,
+  .mk "Emma" Emma, .mk "Frida" Frida, .mk "George" George,
+  .mk "Hank" Hank, .mk "Ivan" Ivan, .mk "Jack" Jack, .mk "Kevin" Kevin,
+  .mk "Lucas" Lucas, .mk "Maks" Maks, .mk "Natan" Natan
+]
+
+def padString (s : String) (len : Nat) : String :=
+  let p := if len > s.length then len - s.length else 0
+  s ++ (String.ofList (List.replicate p ' '))
+
+def printRow (name : String) (cols : List String) : IO Unit := do
+  let mut res := padString name 7
+  for c in cols do
+    res := res ++ "| " ++ padString c 7
+  IO.println res
+
+def formatFloat1 (x : Float) : String :=
+  let scaled := (Float.round (x * 10.0)).toUInt64
+  let intPart := scaled / 10
+  let fracPart := scaled % 10
+  s!"{intPart}.{fracPart}"
+
+def main : IO Unit := do
+  let rounds := 200
+  let numSims := 30 -- Количество симуляций для стохастических игр
+
+  let allNames := allStrategies.map (fun s => match s with | .mk n _ => String.ofList (n.toList.take 5))
+  IO.println "Результаты"
+  printRow "" allNames
+  for s1 in allStrategies do
+    let s1Name := match s1 with | .mk n _ => n
+    let mut cols := []
+    for s2 in allStrategies do
+      match s1, s2 with
+      | .mk _ strat₁, .mk _ strat₂ =>
+        let res ← runSimulations strat₁ strat₂ rounds numSims
+        cols := cols ++ [formatFloat1 res.mean]
+    printRow s1Name cols
+
+  IO.println "\n\nДетерменированные"
+  for s1 in detStrategies do
+    let s1Name := match s1 with | .mk n _ => n
+    let mut totalScore := 0
+    let mut maxStreak := 0
+    for s2 in detStrategies do
+      match s1, s2 with
+      | .mk _ strat₁, .mk _ strat₂ =>
+        let res ← playMatch strat₁ strat₂ rounds
+        totalScore := totalScore + res.scoreA
+        maxStreak := max maxStreak res.streakA_max
+
+    IO.println s!"- {padString s1Name 7} | Общее число очков: {totalScore} | Макс. доминирующая серия: {maxStreak}"
+
+  IO.println "\n\nСтохастические"
+  for s1 in allStrategies do
+    let s1Name := match s1 with | .mk n _ => n
+    let mut allTournamentScores : Array Nat := #[]
+
+    for s2 in allStrategies do
+      match s1, s2 with
+      | .mk _ strat₁, .mk _ strat₂ =>
+        for _ in [0:numSims] do
+          let st ← playMatch strat₁ strat₂ rounds
+          allTournamentScores := allTournamentScores.push st.scoreA
+
+    let sum := allTournamentScores.foldl (· + ·) 0
+    let mean := sum.toFloat / allTournamentScores.size.toFloat
+
+    let sorted := allTournamentScores.qsort (· < ·)
+    let mid := allTournamentScores.size / 2
+    let median := if allTournamentScores.size % 2 == 1 then
+      sorted[mid]!.toFloat
+    else
+      (sorted[mid - 1]!.toFloat + sorted[mid]!.toFloat) / 2.0
+
+    let varSum := allTournamentScores.foldl (fun acc x =>
+      let diff := x.toFloat - mean
+      acc + (diff * diff)
+    ) 0.0
+    let variance := varSum / allTournamentScores.size.toFloat
+
+    IO.println s!"- {padString s1Name 7} | Среднее очков: {formatFloat1 mean} | Медиана: {formatFloat1 median} | Дисперсия: {formatFloat1 variance}"
+
+#eval main
